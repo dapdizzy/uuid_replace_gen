@@ -28,6 +28,52 @@ defmodule UUIDReplaceGenerator do
       |> File.write!(modified_contents)
   end
 
+  def extract(string, regex) do
+    regex
+      |> Regex.scan(string)
+      |> Stream.map(&(hd(&1) <> "\r\n\r\n"))
+      |> Enum.join
+  end
+
+  defp extract_transform(regex_string, source, transformation \\ &(&1)) do
+    regex_string
+      |> Regex.compile!([:caseless, :multiline, :ungreedy])
+      |> Regex.scan(source)
+      |> Stream.map(&((hd(&1) <> "\r\n\r\n") |> transformation))
+      |> Enum.join
+  end
+
+  def transform(source_file, dest_file, prefix \\ "mms") do
+    source = source_file |> File.read!
+    fields =
+      (~S|\s*FIELD\s+\#| <> prefix <> ~S|\w+[\w\W]*ENDPROPERTIES|)
+      |> Regex.compile!([:caseless, :multiline, :ungreedy])
+      |> Regex.scan(source)
+      |> Stream.map(&((hd(&1) <> "\r\n\r\n") |> modify))
+      |> Enum.join
+    field_groups =
+      (~S|\s*GROUP\s+\#| <> prefix <> ~S|\w+[\s\W]*ENDGROUP|)
+      |> extract_transform(source)
+    indexes =
+      (~S|^\s*\#| <> prefix <> ~S|\s*$[\w\W]*ENDPROPERTIES|)
+      |> extract_transform(source)
+    methods =
+      (~S|\s*SOURCE\s+\#| <> prefix <> ~S|\w+[\w\W]*ENDSOURCE|)
+      |> Regex.compile!([:caseless, :multiline, :ungreedy])
+      |> Regex.scan(source)
+      |> Stream.map(&(hd(&1) <> "\r\n\r\n"))
+      |> Enum.join
+    destination = dest_file |> File.read!
+    modified_contents =
+    destination
+      |> String.replace(~r/^\s+ENDFIELDS/mi, fields <> "\r\n\r\nENDFIELDS")
+      |> String.replace(~r/^\s+ENDGROUPS/mi), field_groups <> "\r\n\r\nENDGROUPS")
+      |> String.replace(~r/^\s+INDICES/mi), indexes <> "\r\n\r\nENDINDICES")
+      |> String.replace(~r/^\s+ENDMETHODS/mi, methods <> "\r\n\r\nENDMETHODS")
+    dest_file
+      |> File.write!(modified_contents)
+  end
+
   defp modify_filename(filename) do
     ext = filename |> Path.extname
     (filename |> Path.rootname(ext)) <> "_modified" <> ext
