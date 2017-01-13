@@ -90,7 +90,7 @@ defmodule UUIDReplaceGenerator do
       |> String.replace(~r/^\s+ENDINDICES/mi, indexes <> ~S|\0|)
       |> String.replace(~r/^\s+ENDREFERENCES/mi, references <> ~S|\0|)
       |> String.replace(~r/^\s*ENDDELETEACTIONS/mi, delete_actions <> ~S|\0|)
-      |> String.replace(~r/^\s+ENDMETHODS/mi, methods <> ~S|\0|)
+      |> String.replace(~r/^\s+ENDMETHODS/mi, methods <> ~S|\0|, global: false)
       |> String.replace(~r/^\s*ENDEVENTS/mi, events <> ~S|\0|)
     new_file_name =
       dest_file
@@ -158,7 +158,14 @@ defmodule UUIDReplaceGenerator do
   defp replace_method_definition(source, method_name, replacement) do
     ((method_name |> build_start_method_regex) <> ~S"[\w\W]*ENDSOURCE")
       |> Regex.compile!([:caseless, :ungreedy])
-      |> Regex.replace(source, replacement)
+      |> Regex.replace(source, replacement, global: false)
+  end
+
+  defp get_object_type(definition) do
+    case ~r/(\w+)\s+\#/ |> Regex.run(definition) do
+      [_,x|_t] -> x
+      _ -> nil
+    end
   end
 
   def counterpart_name(filename, prefixes_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
@@ -205,6 +212,18 @@ defmodule UUIDReplaceGenerator do
   end
 
   def replace_prefixes(source, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    stage0 =
+      (~S"select\s+(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")")
+        |> Regex.compile!([:caseless])
+        |> Regex.replace(source, fn x, y -> x |> String.replace(y, "") end, global: true)
+    stage01 =
+      (~S"group\s+by\s+(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")")
+      |> Regex.compile!([:caseless])
+      |> Regex.replace(stage0, fn x, y -> x |> String.replace(y, "") end, global: true)
+    stage02 =
+      (~S"fieldNum\([\w_]+\,\s*(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")")
+      |> Regex.compile!([:caseless, :ungreedy])
+      |> Regex.replace(stage01, fn x, y -> x |> String.replace_suffix(y, "") end, global: true)
     build_stage1_pattern = &(~S"(?<=[\w\s\#\(\!\_\\])(" <> (replacement_map |> Map.keys |> Stream.map(&1) |> Enum.join("|")) <> ")")
     general_replacement_function = &(fn x -> &1[&2.(x)] end) # Performs a lookup in a map given as a first argument a key returned by the function, given as the second
     replacement_function1 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.upcase, v |> String.upcase}), &String.upcase/1)
@@ -214,7 +233,7 @@ defmodule UUIDReplaceGenerator do
     stage1 =
     regex_pattern1
       |> Regex.compile!([:multiline])
-      |> Regex.replace(source, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_function1.(x) end, global: true)
+      |> Regex.replace(stage02, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_function1.(x) end, global: true)
       # |> Regex.replace(source, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_map[x |> String.upcase] |> String.upcase || x end, global: true)
     replacement_function2 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.downcase, v |> String.downcase}), &String.downcase/1)
     regex_pattern2 = build_stage1_pattern.(&String.downcase/1)
