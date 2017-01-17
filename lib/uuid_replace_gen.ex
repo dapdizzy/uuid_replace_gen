@@ -228,8 +228,8 @@ defmodule UUIDReplaceGenerator do
       |> Regex.compile!([:caseless, :ungreedy])
       |> Regex.replace(stage01, fn x, y -> x |> String.replace_suffix(y, "") end, global: true)
     build_stage1_pattern = &(~S"(?<=[\w\s\#\(\!\_\\])(" <> (replacement_map |> Map.keys |> Stream.map(&1) |> Enum.join("|")) <> ")")
-    general_replacement_function = &(fn x -> &1[&2.(x)] end) # Performs a lookup in a map given as a first argument a key returned by the function, given as the second
-    replacement_function1 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.upcase, v |> String.upcase}), &String.upcase/1)
+    general_replacement_function = &(fn x -> &1[&2.(x)] |> &3.(x) end) # Performs a lookup in a map given as a first argument a key returned by the function, given as the second
+    replacement_function1 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.upcase, v |> String.upcase}), &String.upcase/1, fn x, _ -> x end)
     regex_pattern1 = build_stage1_pattern.(&String.upcase/1)
     # ~S"(?<=[\s\#\(\!\\])(" <> (replacement_map |> Map.keys |> Stream.map(&(&1 |> String.upcase)) |> Enum.join("|")) <> ")"
     IO.puts "Regex search pattern1: #{regex_pattern1}"
@@ -238,16 +238,37 @@ defmodule UUIDReplaceGenerator do
       |> Regex.compile!([:multiline])
       |> Regex.replace(stage02, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_function1.(x) end, global: true)
       # |> Regex.replace(source, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_map[x |> String.upcase] |> String.upcase || x end, global: true)
-    replacement_function2 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.downcase, v |> String.downcase}), &String.downcase/1)
+    replacement_function2 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.downcase, v |> String.downcase}), &String.downcase/1, fn x, y -> x |> samecase(y) end)
     regex_pattern2 = build_stage1_pattern.(&String.downcase/1)
     IO.puts "Regex search pattern2: #{regex_pattern2}"
     stage2 =
     regex_pattern2
-      |> Regex.compile!([:multiline])
+      |> Regex.compile!([:multiline, :caseless])
       |> Regex.replace(stage1, replacement_function2, global: true)
     ~S"(?<=\.)(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")"
       |> Regex.compile!([:caseless, :multiline])
       |> Regex.replace(stage2, "")
+  end
+
+  defp is_downcase(codepoint) do
+    "#{codepoint |> String.downcase}" |> Regex.compile! |> Regex.match?(codepoint)
+  end
+
+  def string_to_codepoint_stream(s) do
+    s |> Stream.unfold(
+      fn
+        nil -> nil
+        "" -> nil
+        s ->
+          case s |> String.next_codepoint do
+            {_x, _y} = r -> r
+            nil -> nil
+          end
+        end)
+  end
+
+  def samecase(string, pattern) do
+    pattern |> string_to_codepoint_stream |> Stream.zip(string |> string_to_codepoint_stream) |> Stream.map(fn {x, y} -> if x |> is_downcase, do: y |> String.downcase, else: y |> String.upcase end) |> Enum.join
   end
 
   # Use replace_prefixes_in_files_1 function instead
