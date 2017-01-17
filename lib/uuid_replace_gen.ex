@@ -124,8 +124,11 @@ defmodule UUIDReplaceGenerator do
           transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
           IO.puts "Tramsformed #{&1}"
         else
-          File.copy!(source_folder |> Path.join(&1), output_folder |> Path.join((if &1 |> is_prefixed?(prefix), do: "New___", else: "Unmapped___") <> &1))
-          IO.puts "Copied as new #{&1}"
+          updated_filename = ((if &1 |> is_prefixed?(prefix), do: "New___", else: "Unmapped___") <> &1)
+          new_full_filename = output_folder |> Path.join(updated_filename)
+          source_folder |> Path.join(&1) |> File.copy!(new_full_filename)
+          new_full_filename |> replace_prefixes_in_files_1(replacement_map) # does all the stuff
+          IO.puts "Copied as new #{updated_filename}"
         end))
   end
 
@@ -249,7 +252,7 @@ defmodule UUIDReplaceGenerator do
 
   # Use replace_prefixes_in_files_1 function instead
   def replace_prefixes_in_files(filename, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
-    write_handle = filename |> modify_filename|> File.open!([:write, encoding: :latin1])
+    write_handle = filename |> modify_filename |> File.open!([:write, encoding: :latin1])
     filename |> File.stream!([encoding: :latin1], :line) |> Stream.map(fn frame -> frame |> replace_prefixes(replacement_map) end)
       |> Enum.each(&(write_handle |> IO.puts(&1 <> "\r\n")))
     write_handle |> File.close
