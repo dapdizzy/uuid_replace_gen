@@ -39,7 +39,7 @@ defmodule UUIDReplaceGenerator do
     regex_string
       |> Regex.compile!([:caseless, :multiline, :ungreedy])
       |> Regex.scan(source)
-      |> Stream.map(&((hd(&1) <> "\r\n\r\n") |> transformation.()))
+      |> Stream.map(&((hd(&1)) |> transformation.()))
       |> Enum.join
   end
 
@@ -52,7 +52,7 @@ defmodule UUIDReplaceGenerator do
   def transform(source_file, dest_file, output_folder, prefix \\ "mms") do
     source = source_file |> File.read!
     fields =
-      (~S|\s*FIELD\s+\#| <> prefix <> ~S|\w+[\w\W]*ENDPROPERTIES|)
+      (~S|^\s*FIELD\s+\#| <> prefix <> ~S|\w+\s*^\s*\w+\s*$[\w\W]*ENDPROPERTIES|)
       |> extract_transform(source, &modify/1)
       # |> Regex.compile!([:caseless, :multiline, :ungreedy])
       # |> Regex.scan(source)
@@ -62,7 +62,7 @@ defmodule UUIDReplaceGenerator do
       (~S|\s*GROUP\s+\#| <> prefix <> ~S|\w+[\s\W]*ENDGROUP|)
       |> extract_transform(source)
     indexes =
-      (~S|^\s*\#| <> prefix <> ~S|\w+\s*$[\w\W]*ENDINDEXFIELDS|)
+      (~S|^\s*\#| <> prefix <> ~S|\w+\s*^\s*PROPERTIES\s*[\w\W]*ENDINDEXFIELDS|)
       |> extract_transform(source)
     references =
       (~S|^\s*REFERENCE\s+\#| <> prefix <> ~S|\w+[\w\W]*ENDREFERENCE|)
@@ -120,6 +120,20 @@ defmodule UUIDReplaceGenerator do
     source_folder
       |> File.ls!
       |> Enum.each(
+        fn x ->
+        #   spawn(fn ->
+        #     &(if &1 |> has_counterpart?(destination_folder) do
+        #       transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
+        #       IO.puts "Tramsformed #{&1}"
+        #     else
+        #       updated_filename = ((if &1 |> is_prefixed?(prefix), do: "New___", else: "Unmapped___") <> &1)
+        #       new_full_filename = output_folder |> Path.join(updated_filename)
+        #       source_folder |> Path.join(&1) |> File.copy!(new_full_filename)
+        #       new_full_filename |> replace_prefixes_in_files_1(replacement_map) # does all the stuff
+        #       IO.puts "Copied as new #{updated_filename}"
+        #     end).(x)
+        #   end)
+        # end)
         &(if &1 |> has_counterpart?(destination_folder) do
           transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
           IO.puts "Tramsformed #{&1}"
