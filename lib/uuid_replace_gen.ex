@@ -116,6 +116,39 @@ defmodule UUIDReplaceGenerator do
     (~S"^\s*" <> prefix) |> Regex.compile!([:caseless]) |> Regex.match?(name)
   end
 
+  def process_files(folder, processor) do
+    folder
+      |> File.ls!
+      |> Enum.map(&Task.async(fn -> processor.(&1) end))
+      |> Enum.each(&Task.await/1)
+  end
+
+  def transform_enums(filename, folder, counterpart_folder, output_folder, prefix \\ "MMS") do
+    contents = folder |> Path.join(filename) |> File.read!
+    case contents |> object_name_type do
+      {"ENUMTYPE", name} ->
+        unless name |> is_prefixed?(prefix) do
+          IO.puts "Enum #{name} found"
+          counterpart_name = filename |> counterpart_filename(counterpart_folder)
+          if counterpart_name |> File.exists? do
+            new_values =
+            ~S"^\s*\#" <> prefix <> ~S"[\w\W]*ENDPROPERTIES"
+              |> Regex.compile!([:ungreedy, :multiline, :caseless])
+              |> Regex.scan(contents)
+              |> Stream.map(&(&1 |> hd))
+              |> Enum.join("\r\n")
+            updated_counterpart_contents =
+              counterpart_name |> File.read!
+                |> String.replace(~r/^\s*ENDTYPEELEMENTS/imU, new_values <> ~S"\0", global: false)
+            new_filename = filename |> counterpart_filename(output_folder)
+            new_filename |> File.write!(updated_counterpart_contents)
+            IO.puts "Updated #{new_filename}"
+          end
+        end
+      _ -> nil
+    end
+  end
+
   def transform_files(source_folder, destination_folder, output_folder, prefix \\ "mms", replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
     source_folder
       |> File.ls!
@@ -178,9 +211,16 @@ defmodule UUIDReplaceGenerator do
       |> Regex.replace(source, replacement, global: false)
   end
 
-  defp get_object_type(definition) do
+  def get_object_type(definition) do
     case ~r/(\w+)\s+\#/ |> Regex.run(definition) do
       [_,x|_t] -> x
+      _ -> nil
+    end
+  end
+
+  def object_name_type(definition) do
+    case ~r/(\w+)\s+\#(\w+)\b/ |> Regex.run(definition) do
+      [_, type, name|_t] -> {type, name}
       _ -> nil
     end
   end
@@ -241,7 +281,11 @@ defmodule UUIDReplaceGenerator do
       (~S"fieldNum\([\w_]+\,\s*(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")")
       |> Regex.compile!([:caseless, :ungreedy])
       |> Regex.replace(stage01, fn x, y -> x |> String.replace_suffix(y, "") end, global: true)
-    build_stage1_pattern = &(~S"(?<=[\w\s\#\(\!\_\\])(" <> (replacement_map |> Map.keys |> Stream.map(&1) |> Enum.join("|")) <> ")")
+    stage03 =
+      (~S"^\s*\#(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ~S")[\w_]*\s*$")
+      |> Regex.compile!([:caseless, :ungreedy, :multiline])
+      |> Regex.replace(stage02, fn x, y -> x |> String.replace(y, "") end, global: true)
+    build_stage1_pattern = &(~S"(?<=[\w\s\#\(\!\_\[\\])(" <> (replacement_map |> Map.keys |> Stream.map(&1) |> Enum.join("|")) <> ")")
     general_replacement_function = &(fn x -> &1[&2.(x)] |> &3.(x) end) # Performs a lookup in a map given as a first argument a key returned by the function, given as the second
     replacement_function1 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.upcase, v |> String.upcase}), &String.upcase/1, fn x, _ -> x end)
     regex_pattern1 = build_stage1_pattern.(&String.upcase/1)
@@ -250,7 +294,7 @@ defmodule UUIDReplaceGenerator do
     stage1 =
     regex_pattern1
       |> Regex.compile!([:multiline])
-      |> Regex.replace(stage02, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_function1.(x) end, global: true)
+      |> Regex.replace(stage03, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_function1.(x) end, global: true)
       # |> Regex.replace(source, fn y, x -> if y |> String.starts_with?("."), do: ".", else: replacement_map[x |> String.upcase] |> String.upcase || x end, global: true)
     replacement_function2 = general_replacement_function.((for {k, v} <- replacement_map, into: %{}, do: {k |> String.downcase, v |> String.downcase}), &String.downcase/1, fn x, y -> x |> samecase(y) end)
     regex_pattern2 = build_stage1_pattern.(&String.downcase/1)
