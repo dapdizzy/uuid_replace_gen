@@ -16,6 +16,91 @@ defmodule UUIDReplaceGenerator do
       |> Regex.replace(string, fn -> "{" <> UUID.uuid4 <> "}" end, global: true)
   end
 
+  def probing_names(name, prefixes \\ ["clear", "modified", "New"]) do
+    ext = name |> Path.extname
+    basename = name |> Path.basename(ext)
+    prefixes |> Stream.unfold(fn [] -> nil; [h|t] -> {h <> "___" <> basename <> "__DBT" <> ext, t} end)
+  end
+
+  def eliminate_name_prefix(string, prefixes) do
+    ~S/^\s*Name\s*\#(/ <> (prefixes |> Enum.join("|")) <> ~S")\w*\s*$"
+      |> Regex.compile!([:ungreedy, :caseless, :multiline])
+      |> Regex.replace(string, fn x, y -> x |> String.replace(y, "") end)
+  end
+
+  def transform_query(definition, prefixes_map \\ %{"TRX" => "TMS", "WAX" => "WHS"}) do
+    prefixes_rex =
+    (prefixes_pattern = "(" <> (prefixes_map |> Map.keys |> Enum.join("|")) <> ")")
+      |> Regex.compile!([:caseless, :ungreedy, :multiline])
+    value_prefixes = prefixes_map |> Map.values
+    stage0 =
+      # ~S/^\s*(QUERY|Table|Name|Block)\s*\#/ <> prefixes_pattern <> ~S"\w*\s*$"
+      prefixes_rex
+      # prefixes_pattern
+      # |> Regex.compile!([:caseless, :multiline, :ungreedy])
+      |> Regex.replace(definition, fn x, y -> x |> String.replace(y, prefixes_map[y |> String.upcase]) end, global: true)
+    replacement_prefixes_rex = ~S/^\s*(\w+)\s*\#/ <> "(" <> (value_prefixes |> Enum.join("|")) <> ")" <> ~S/\w+\s*$/ |> Regex.compile!([:caseless, :multiline, :ungreedy])
+    replacement_func = fn x, c1, c2 ->
+      unless c1 |> String.downcase == "table" do
+        x |> String.replace(c2, "")
+      else
+        x
+      end
+    end
+    replacement_func_wrapped = &(replacement_prefixes_rex |> Regex.replace(&1, replacement_func))
+    stage1 =
+    ~r/^\s*FIELDLIST\s*$[\w\W]*ENDFIELDLIST/miU
+      |> Regex.replace(stage0, replacement_func_wrapped)
+      #  &(prefixes_rex |> Regex.replace(&1 |> eliminate_name_prefix(value_prefixes), fn x, y -> x |> String.replace(y, "") end, global: true))
+      # |> eliminate_name_prefix(value_prefixes)
+    ~r/^\s*LINES\s*$[\w\W]*ENDLINES/miU
+      |> Regex.replace(stage1, replacement_func_wrapped)
+      # &(prefixes_rex |> Regex.replace(&1 |> eliminate_name_prefix(value_prefixes), fn x, y -> x |> String.replace(y, "") end, global: true))
+      # |> eliminate_name_prefix(value_prefixes)
+    # fieldlist =
+    # (fieldlist_rex = ~r/^\s*FIELDLIST\s*$[\w\W]*ENDFIELDLIST/miU)
+    #   |> Regex.run(definition) |> hd
+    # lines =
+    # (lines_rex = ~r/^\s*LINES\s*$[\w\W]*ENDLINES/miU)
+    #   |> Regex.run(definition) |> hd
+    # definition
+    #   |> String.replace(fieldlist_rex, prefixes_rex |> Regex.replace(fn x, y -> x |> String.replace(y, "", global: true) end, global: false), global: false)
+    #   |> String.replace(lines_rex, lines_rex |> Regex.replace(fn x, y -> x |> String.replace(y, "", global: true) end, global: false)
+  end
+
+  def copy_missing_relations(filename, source_folder, search_folder, output_folder) do
+    counterpart_filename =
+    filename |> probing_names |> Enum.reduce_while(nil, fn x, _acc ->
+      if search_folder |> Path.join(x) |> File.exists? do
+        {:halt, x}
+      else
+        {:cont, nil}
+      end
+    end)
+    unless counterpart_filename == nil do
+      IO.puts "Counterpart filename #{counterpart_filename}"
+      rex = ~r/^\s*REFERENCES\s*$[\w\W]*ENDREFERENCES/miU
+      source_contents = search_folder |> Path.join(counterpart_filename) |> File.read!
+      good_references =
+        rex
+        |> Regex.run(source_contents) |> hd
+      rex2 = ~r/^\s*DELETEACTIONS\s*$[\w\W]*ENDDELETEACTIONS/miU
+      good_delete_actions =
+        rex2
+        |> Regex.run(source_contents) |> hd
+      good_contents =
+        source_folder |> Path.join(filename) |> File.read!
+        |> String.replace(rex, good_references, global: false)
+        |> String.replace(rex2, good_delete_actions, global: false)
+      output_folder |> Path.join(good_filename = "Patched___" <> filename)
+        |> File.write!(good_contents)
+      IO.puts "#{good_filename}"
+    else
+      IO.puts "Counterpart for #{filename} is not found"
+      IO.puts "------------------Skipped---------------"
+    end
+  end
+
   def extract_mms(filename) do
     contents = filename |> File.read!
     modified_contents =
@@ -150,33 +235,37 @@ defmodule UUIDReplaceGenerator do
   end
 
   def transform_files(source_folder, destination_folder, output_folder, prefix \\ "mms", replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    # handle = "C:/Txt/list_22.txt" |> File.open!([:utf8, :append])
     source_folder
       |> File.ls!
       |> Enum.each(
         &(spawn(
           fn ->
             (if &1 |> has_counterpart?(destination_folder) do
-              transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
+              new_filename = transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
               IO.puts "Tramsformed #{&1}"
+              case source_folder |> Path.join(&1) |> File.read! |> object_name_type do
+                {type, name} -> unless (type |> String.downcase == "frm") and (new_filename |> Path.basename |> String.downcase |> String.starts_with?("modified")), do: "C:/Txt/list_22.txt" |> File.open!([:utf8, :append], fn file -> file |> IO.puts("#{type} #{name}\r\n") end)
+                _ -> nil
+              end
             else
               updated_filename = ((if &1 |> is_prefixed?(prefix), do: "New___", else: "Unmapped___") <> &1)
               new_full_filename = output_folder |> Path.join(updated_filename)
               source_folder |> Path.join(&1) |> File.copy!(new_full_filename)
               new_full_filename |> replace_prefixes_in_files_1(replacement_map) # does all the stuff
               IO.puts "Copied as new #{updated_filename}"
+              unless updated_filename |> String.downcase |> String.starts_with?("unmapped") do
+                case source_folder |> Path.join(&1) |> File.read! |> object_name_type do
+                  {type, name} ->
+                    "C:/Txt/list_22.txt" |> File.open!([:utf8, :append], fn file -> file |> IO.puts("#{type} #{name}\r\n") end)
+                    # handle |> IO.write("#{type} #{name}; ")
+                  _ -> nil
+                end
+              end
             end)
           end)
         ))
-        # &(if &1 |> has_counterpart?(destination_folder) do
-        #   transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
-        #   IO.puts "Tramsformed #{&1}"
-        # else
-        #   updated_filename = ((if &1 |> is_prefixed?(prefix), do: "New___", else: "Unmapped___") <> &1)
-        #   new_full_filename = output_folder |> Path.join(updated_filename)
-        #   source_folder |> Path.join(&1) |> File.copy!(new_full_filename)
-        #   new_full_filename |> replace_prefixes_in_files_1(replacement_map) # does all the stuff
-        #   IO.puts "Copied as new #{updated_filename}"
-        # end))
+    # File.close(handle)
   end
 
   defp process_modified_methods(source, destination, prefix \\ "mms") do
@@ -325,6 +414,12 @@ defmodule UUIDReplaceGenerator do
         end)
   end
 
+  def replace_samecase(source, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    "(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")"
+      |> Regex.compile!([:caseless])
+      |> Regex.replace(source, fn x, y -> x |> String.replace(y, replacement_map[y |> String.upcase] |> samecase(y)) end, global: true)
+  end
+
   def samecase(string, pattern) do
     pattern |> string_to_codepoint_stream |> Stream.zip(string |> string_to_codepoint_stream) |> Stream.map(fn {x, y} -> if x |> is_downcase, do: y |> String.downcase, else: y |> String.upcase end) |> Enum.join
   end
@@ -340,6 +435,7 @@ defmodule UUIDReplaceGenerator do
   def replace_prefixes_in_files_1(filename, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
     contents = filename |> File.read! |> replace_prefixes(replacement_map)
     filename |> File.write!(contents)
+    filename
   end
 
   defp modify_filename(filename) do
