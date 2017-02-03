@@ -208,6 +208,16 @@ defmodule UUIDReplaceGenerator do
       |> Enum.each(&Task.await/1)
   end
 
+  def write_mms_form(filename, foldername) do
+    contents = foldername |> Path.join(filename) |> File.read!
+    case contents |> object_name_type do
+      {type, name} ->
+        if (type |> String.downcase == "form" and not (name |> String.downcase |> String.starts_with?("mms")) and ~r/mms/im |> Regex.match?(contents)) do
+          filename |> AsyncFileWriter.write
+        end
+    end
+  end
+
   def transform_enums(filename, folder, counterpart_folder, output_folder, prefix \\ "MMS") do
     contents = folder |> Path.join(filename) |> File.read!
     case contents |> object_name_type do
@@ -243,9 +253,10 @@ defmodule UUIDReplaceGenerator do
           fn ->
             (if &1 |> has_counterpart?(destination_folder) do
               new_filename = transform_replace(source_folder |> Path.join(&1), &1 |> counterpart_filename(destination_folder), output_folder, prefix, replacement_map)
-              IO.puts "Tramsformed #{&1}"
+              IO.puts "Tramsformed #{&1} as #{new_filename}"
               case source_folder |> Path.join(&1) |> File.read! |> object_name_type do
-                {type, name} -> unless (type |> String.downcase == "frm") and (new_filename |> Path.basename |> String.downcase |> String.starts_with?("modified")), do: "C:/Txt/list_22.txt" |> File.open!([:utf8, :append], fn file -> file |> IO.puts("#{type} #{name}\r\n") end)
+                {type, name} -> if (type |> String.downcase == "form") and (new_filename |> Path.basename |> String.downcase |> String.starts_with?("modified")), do: name |> AsyncFileWriter.write
+                # "C:/Txt/list_22.txt" |> File.open!([:utf8, :append], fn file -> file |> IO.puts("#{type} #{name}\r\n") end)
                 _ -> nil
               end
             else
@@ -254,14 +265,14 @@ defmodule UUIDReplaceGenerator do
               source_folder |> Path.join(&1) |> File.copy!(new_full_filename)
               new_full_filename |> replace_prefixes_in_files_1(replacement_map) # does all the stuff
               IO.puts "Copied as new #{updated_filename}"
-              unless updated_filename |> String.downcase |> String.starts_with?("unmapped") do
-                case source_folder |> Path.join(&1) |> File.read! |> object_name_type do
-                  {type, name} ->
-                    "C:/Txt/list_22.txt" |> File.open!([:utf8, :append], fn file -> file |> IO.puts("#{type} #{name}\r\n") end)
-                    # handle |> IO.write("#{type} #{name}; ")
-                  _ -> nil
-                end
-              end
+              # unless updated_filename |> String.downcase |> String.starts_with?("unmapped") do
+              #   case source_folder |> Path.join(&1) |> File.read! |> object_name_type do
+              #     {type, name} ->
+              #       "C:/Txt/list_22.txt" |> File.open!([:utf8, :append], fn file -> file |> IO.puts("#{type} #{name}\r\n") end)
+              #       # handle |> IO.write("#{type} #{name}; ")
+              #     _ -> nil
+              #   end
+              # end
             end)
           end)
         ))
@@ -436,6 +447,18 @@ defmodule UUIDReplaceGenerator do
     contents = filename |> File.read! |> replace_prefixes(replacement_map)
     filename |> File.write!(contents)
     filename
+  end
+
+  def new_form_name(name, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    ~S"^(" <> (replacement_map |> Map.keys |> Stream.map(&String.upcase/1) |> Enum.join("|")) <> ")"
+      |> Regex.compile!([:caseless, :multiline])
+      |> Regex.replace(name, fn x, y -> x |> String.replace(y, replacement_map[y |> String.upcase]) end)
+  end
+
+  def transform_form_contents(contents, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    ~S"[\s\_\.\:\(\[\#](" <> (replacement_map |> Map.keys |> Stream.map(&String.upcase/1) |> Enum.join("|")) <> ")"
+      |> Regex.compile!([:caseless, :multiline])
+      |> Regex.replace(contents, fn x, y -> x |> String.replace(y, replacement_map[y |> String.upcase], global: true) end, global: true)
   end
 
   defp modify_filename(filename) do
