@@ -203,9 +203,46 @@ defmodule UUIDReplaceGenerator do
 
   def process_files(folder, processor) do
     folder
-      |> File.ls!
       |> Enum.map(&Task.async(fn -> processor.(&1) end))
       |> Enum.each(&Task.await/1)
+  end
+
+  def process_files_w_tasks(folder, processor) do
+    ref_map =
+      folder
+      |> File.ls!
+      |> Enum.reduce(%{},
+        fn x, map ->
+          task = Task.async(fn -> processor.(x) end)
+          map |> Map.put(task.ref, task)
+        end)
+    accumulate_results ref_map, %{}
+  end
+
+  def accumulate_results(ref_map, result_map) when ref_map == %{} do
+    result_map
+  end
+
+  def accumulate_results(ref_map, result_map) do
+    receive do
+      {ref, result} ->
+        if ref_map |> Map.has_key?(ref) do
+          case result do
+            {r2_name, r3_name, field_mapping} ->
+              new_result_map = result_map |> Map.put(r2_name, {r3_name, field_mapping})
+              ref_map |> Map.delete(ref) |> accumulate_results(new_result_map)
+            _ ->
+              IO.puts "Invalid format for ref #{inspect ref}: #{inspect result}"
+              accumulate_results ref_map, result_map
+          end
+        else
+          IO.puts "Invalid ref #{inspect ref}"
+          accumulate_results ref_map, result_map
+        end
+      after 30_000 ->
+        IO.puts "Timeout of 30 seconds has occured. Returning result though."
+        result_map
+      end
   end
 
   def write_mms_form(filename, foldername) do
@@ -449,6 +486,13 @@ defmodule UUIDReplaceGenerator do
     filename
   end
 
+  def replace_prefixes_in_files_2(filename, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    filename |> File.open!([:write])
+    contents = filename |> File.read! |> replace_prefixes(replacement_map)
+    filename |> File.write!(contents)
+    filename
+  end
+
   def new_form_name(name, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
     ~S"^(" <> (replacement_map |> Map.keys |> Stream.map(&String.upcase/1) |> Enum.join("|")) <> ")"
       |> Regex.compile!([:caseless, :multiline])
@@ -464,5 +508,59 @@ defmodule UUIDReplaceGenerator do
   defp modify_filename(filename) do
     ext = filename |> Path.extname
     (filename |> Path.rootname(ext)) <> "_modified" <> ext
+  end
+
+  defp replace_table_prefix(table_name, prefixes_map \\ %{"WHS" => "WAX", "TMS" => "TRX", "AWH" => "WAX", "ATM" => "TRX"}) do
+    ~S"^(" <> (prefixes_map |> Map.keys |> Stream.map(&String.upcase/1) |> Enum.join("|")) <> ")"
+      |> Regex.compile!([:caseless]) |> Regex.replace(table_name, fn x, y -> x |> String.replace(y, prefixes_map[y |> String.upcase] |> samecase(y)) end)
+  end
+
+  def map_fields(r2_definition, r3_definition) do
+    ~r/^\s*FIELD\s+\#(\w+)\s*$/miU |> Regex.scan(r2_definition)
+      |> Enum.reduce(%{}, fn [_, field_name], map -> map |> Map.put(field_name, find_field_name(field_name, r3_definition)) end)
+  end
+
+  defp extract_field_prefix(field_name, prefixes) do
+    case "^(" <> (prefixes |> Stream.filter(&(String.trim(&1) != "")) |> Enum.join("|")) <> ~S")(\w+)"
+      |> Regex.compile!([:caseless, :multiline])
+      |> Regex.run(field_name) do
+        [_, prefix, name] -> {prefix, name}
+        _ -> {"", field_name}
+      end
+  end
+
+  defp do_find_field_name(field_name, definition, prefixes_list) do
+    {prefix, remaining_prefixes} =
+      case prefixes_list do
+        [h|t] -> {h, t}
+        _ -> {"", nil}
+      end
+    if field_pattern(probe_field_name = prefix <> field_name) |> Regex.compile!([:caseless, :multiline, :ungreedy]) |> Regex.match?(definition) do
+      probe_field_name
+    else
+      if (remaining_prefixes != nil) do
+        do_find_field_name field_name, definition, remaining_prefixes
+      else
+        nil
+      end
+    end
+  end
+
+  defp find_field_name(field_name, definition, prefixes_map \\ %{"" => ["", "WHS", "AWH", "TMS", "ATM"], "WAX" => ["", "WHS", "AWH"], "TRX" => ["", "TMS", "ATM"]}) do
+    {prefix, name} = field_name |> extract_field_prefix(prefixes_map |> Map.keys)
+    do_find_field_name name, definition, prefixes_map[prefix]
+  end
+
+  defp field_pattern(field_name) do
+    ~S"^\s*FIELD\s+\#" <> (field_name |> String.trim |> Regex.escape) <> ~S"\s*$"
+  end
+
+  def map_table_mapping(filename, foldername, seekfoldername) do
+    contents = foldername |> Path.join(filename) |> File.read!
+    counterpart_name = filename |> replace_table_prefix
+    counterpart_contents = seekfoldername |> Path.join(counterpart_name) |> File.read!
+    field_mapping = map_fields(counterpart_contents, contents)
+    ext = filename |> Path.extname
+    {counterpart_name |> Path.basename("__DBT" <> ext), filename |> Path.basename("__DBT" <> ext), field_mapping}
   end
 end
