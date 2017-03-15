@@ -134,6 +134,84 @@ defmodule UUIDReplaceGenerator do
       |> replace_prefixes_in_files_1(replacement_map)
   end
 
+  def index_pattern(index_name) do
+    ~S|^\s+\#| <> index_name <> ~S|\s*$[\w\W]*ENDINDEXFIELDS| |> Regex.compile!([:multiline, :caseless, :ungreedy])
+  end
+
+  def replace_prefix_and_match_field(name, fields, replacement_map \\ %{"WAX" => ["", "WHS", "AWH"], "TRX" => ["", "TMS", "ATM"]}) do
+    prefix_rex = ~S"^\s*(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")" |> Regex.compile!([:ungreedy, :caseless, :multiline])
+    IO.puts "Prefix rex: #{inspect prefix_rex}"
+    res =
+      case prefix_rex |> Regex.run(name) do
+        [_h,prefix|_t] ->
+          replacement_map[prefix |> String.upcase] |> Enum.reduce_while(nil, fn pref, nil ->
+            IO.puts "Probe prefix: #{pref}"
+            probe_name = name |> String.replace_prefix(prefix, pref) |> String.upcase
+            IO.puts "Contender field: #{probe_name}"
+            if fields |> Enum.member?(probe_name) do
+              {:halt, probe_name}
+            else
+              {:cont, nil}
+            end
+          end)
+        _ -> name
+      end
+    IO.puts "replaced field name: #{res}"
+    res || name
+  end
+
+  def index_replace_prefix(index_name, replacement_map \\ %{"WHS" => "WAX", "AWH" => "WAX", "TMS" => "TRX", "ATM" => "TRX"}) do
+    ~S|^\s*(| <> (replacement_map |> Map.keys |> Enum.join("|")) <> ~S|)\w*\s*$| |> Regex.compile!([:caseless])
+      |> Regex.replace(index_name, fn body, prefix -> body |> String.replace(prefix, replacement_map[prefix |> String.upcase] |> samecase(prefix)) end)
+  end
+
+  def fields(table_def) do
+    fields_def = ~r/FIELDS([\w\W]*)ENDFIELDS/miU
+      |> Regex.run(table_def) |> List.last
+    ~r/^\s+FIELD\s*\#(\w*)\s*$/m |> Regex.scan(fields_def)
+      |> Enum.map(fn [_h,field_name|_t] -> field_name end)
+  end
+
+  def copy_index_fields(source, destination) do
+    indexes_rex = ~r/INDICES([\w\W]*)ENDINDICES/miU
+    source_indexes = indexes_rex
+      |> Regex.run(source) |> List.last
+    destination_indexes = indexes_rex
+      |> Regex.run(destination)
+      |> List.last
+    index_names_and_fields =
+      ~r/^\s+\#(\w*)\s*^\s*PROPERTIES[\w\W]*ENDINDEXFIELDS/miU
+        |> Regex.scan(destination_indexes)
+        |> Stream.map(fn [index_def, index_name|_t] ->
+          dst_index_fields = ~r/INDEXFIELDS(?<body>[\w\W]*)ENDINDEXFIELDS/miU |> Regex.run(index_def) |> List.last
+          IO.puts "#{index_name}:\r\nIndex def:#{index_def}\r\nIndex fields:#{inspect dst_index_fields}"
+          new_index_fields =
+            if ~r/^\s*$/m |> Regex.match?(index_def) do
+              source_index_def = index_name |> index_replace_prefix |> index_pattern |> Regex.run(source_indexes) |> hd
+              source_index_fields = ~r/INDEXFIELDS([\w\W]*)ENDINDEXFIELDS/miU |> Regex.run(source_index_def) |> List.last
+              destination_fields = destination |> fields() |> Enum.map(&String.upcase/1)
+              IO.puts "Source index fields: #{source_index_fields}"
+              ~r/^\s+\#(\w*)\s*$/mU |> Regex.scan(source_index_fields)
+                |> Stream.map(fn [line, field|_t] -> line |> String.replace(field, field |> replace_prefix_and_match_field(destination_fields)); _ -> "" end)
+                |> Enum.join("\r\n")
+            else
+              dst_index_fields
+            end
+          {index_name, new_index_fields}
+        end) |> Enum.reduce(%{}, fn {name, value}, map -> map |> Map.put(name, value) end)
+    IO.puts "index fields map: #{inspect index_names_and_fields}"
+    new_indexes_def =
+      ~r/^\s+\#(\w*)\s*^\s*PROPERTIES[\w\W]*ENDINDEXFIELDS/miU
+        |> Regex.scan(destination)
+        |> Stream.map(fn [body, index_name|_t] ->
+          ~r/INDEXFIELDS\s*ENDINDEXFIELDS/imU |> Regex.replace(body, ["INDEXFIELDS", index_names_and_fields[index_name], "ENDINDEXFIELDS"] |> Enum.join("\r\n"))
+        end)
+        |> Enum.join("\r\n")
+    IO.puts "New indexes def:\r\n#{new_indexes_def}"
+    indexes_rex |> Regex.replace(destination, ["INDICES", new_indexes_def, "ENDINDICES"] |> Enum.join("\r\n"))
+    #destination |> String.replace(~r/INDICES[\w\W]*ENDINDICES/miU, new_indexes_def)
+  end
+
   def transform(source_file, dest_file, output_folder, prefix \\ "mms") do
     source = source_file |> File.read!
     fields =
@@ -546,9 +624,25 @@ defmodule UUIDReplaceGenerator do
     end
   end
 
+  defp has_mms_prefix?(name) do
+    name |> String.downcase |> String.starts_with?("mms")
+  end
+
+  defp preprocess_mms_prefix(name, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    if name |> has_mms_prefix? do
+      replace_samecase(name, replacement_map)
+    else
+      name
+    end
+  end
+
+  defp enrich_prefixes(prefixes, prefix) do
+    if prefix != "", do: [prefix|prefixes], else: prefixes
+  end
+
   defp find_field_name(field_name, definition, prefixes_map \\ %{"" => ["", "WHS", "AWH", "TMS", "ATM"], "WAX" => ["", "WHS", "AWH"], "TRX" => ["", "TMS", "ATM"]}) do
     {prefix, name} = field_name |> extract_field_prefix(prefixes_map |> Map.keys)
-    do_find_field_name name, definition, prefixes_map[prefix]
+    do_find_field_name preprocess_mms_prefix(name), definition, enrich_prefixes(prefixes_map[prefix], prefix)
   end
 
   defp field_pattern(field_name) do
@@ -561,6 +655,6 @@ defmodule UUIDReplaceGenerator do
     counterpart_contents = seekfoldername |> Path.join(counterpart_name) |> File.read!
     field_mapping = map_fields(counterpart_contents, contents)
     ext = filename |> Path.extname
-    {counterpart_name |> Path.basename("__DBT" <> ext), filename |> Path.basename("__DBT" <> ext), field_mapping}
+    {counterpart_name |> Path.basename(ext), filename |> Path.basename(ext), field_mapping}
   end
 end
