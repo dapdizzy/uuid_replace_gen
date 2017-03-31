@@ -139,7 +139,7 @@ defmodule UUIDReplaceGenerator do
   end
 
   def replace_prefix_and_match_field(name, fields, replacement_map \\ %{"WAX" => ["", "WHS", "AWH"], "TRX" => ["", "TMS", "ATM"]}) do
-    prefix_rex = ~S"^\s*(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")" |> Regex.compile!([:ungreedy, :caseless, :multiline])
+    prefix_rex = ~S"[\s\#]*(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")" |> Regex.compile!([:ungreedy, :caseless, :multiline])
     IO.puts "Prefix rex: #{inspect prefix_rex}"
     res =
       case prefix_rex |> Regex.run(name) do
@@ -172,6 +172,68 @@ defmodule UUIDReplaceGenerator do
       |> Enum.map(fn [_h,field_name|_t] -> field_name end)
   end
 
+  def field_group_rex(group_name) do
+    ~S"^\s*GROUP\s+\#" <> group_name <> ~S"\s*$[\w\W]*ENDGROUP"
+      |> Regex.compile!([:caseless, :multiline, :ungreedy])
+  end
+
+  def append_group(groups_definition, group_definition) do
+    [groups_definition, group_definition] |> Enum.join("\r\n")
+    #groups_definition |> String.replace(~r/^\s*ENDGROUPS/miU, group_definition <> ~S"\0", global: false)
+  end
+
+  def replace_prefixes_w_pre_prefix1(s, _) do
+    s
+  end
+
+  def replace_prefixes_w_pre_prefix(definition, pre_prefix, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
+    (pre_prefix <> "(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")")
+      |> Regex.compile!([:caseless, :ungreedy, :multiline])
+      |> Regex.replace(definition, fn x, y -> x |> String.replace(y, replacement_map[y |> String.upcase] |> samecase(y)) end)
+  end
+
+  def extract_field_groups_def(definition) do
+    field_group_def_rex = group_definition_rex "GROUPS", "ENDGROUPS"
+    field_group_def_rex |> first_capture(definition)
+  end
+
+  def find_field_group(groups, group_name) do
+    group_name |> field_group_rex |> capture_at(groups, 0)
+  end
+
+  def group_fields_rex do
+    ~r/^\s*GROUPFIELDS\s*$([\w\W]*)^\s*ENDGROUPFIELDS\s*$]/miU
+  end
+
+  def extract_group_fields(group_definition) do
+    group_fields_rex |> capture_at(group_definition, 1)
+  end
+
+  def copy_field_groups(source, destination) do
+    field_groups_rex = group_definition_rex "GROUPS", "ENDGROUPS"
+    source_groups = field_groups_rex |> first_capture(source)
+    destination_groups = field_groups_rex |> first_capture(destination)
+    destination_fields = destination |> fields
+    new_groups =
+      ~r/^\s*GROUP\s+\#(\w+)\s*$([\w\W]*)^\s*ENDGROUP\s*$/miU
+        |> Regex.scan(source_groups)
+        |> Enum.reduce(destination_groups, fn [group_def, group_name|_t], groups ->
+          #case group_name |> field_group_rex |> capture_at(destination_groups, 0) do
+          case destination_groups |> find_field_group(group_name) do
+            nil -> # No field group
+              groups |> append_group(group_def |> replace_samecase)
+            dst_group_definition ->
+              if (x = dst_group_definition |> extract_group_fields) && x |> is_binary && (x =~ ~r/\s*/miU) do # means field group definition is empty
+                groups |> append_group(group_def |> replace_samecase)
+                #append_group(group_def |> replace_prefixes_w_pre_prefix(~S"\#"))
+              else
+                groups
+              end
+          end
+        end)
+    field_groups_rex |> Regex.replace(destination, ["GROUPS", new_groups, "ENDGROUPS"] |> Enum.join("\r\n"))
+  end
+
   def copy_index_fields(source, destination) do
     indexes_rex = ~r/INDICES([\w\W]*)ENDINDICES/miU
     source_indexes = indexes_rex
@@ -186,14 +248,23 @@ defmodule UUIDReplaceGenerator do
           dst_index_fields = ~r/INDEXFIELDS(?<body>[\w\W]*)ENDINDEXFIELDS/miU |> Regex.run(index_def) |> List.last
           IO.puts "#{index_name}:\r\nIndex def:#{index_def}\r\nIndex fields:#{inspect dst_index_fields}"
           new_index_fields =
-            if ~r/^\s*$/m |> Regex.match?(index_def) do
-              source_index_def = index_name |> index_replace_prefix |> index_pattern |> Regex.run(source_indexes) |> hd
-              source_index_fields = ~r/INDEXFIELDS([\w\W]*)ENDINDEXFIELDS/miU |> Regex.run(source_index_def) |> List.last
-              destination_fields = destination |> fields() |> Enum.map(&String.upcase/1)
-              IO.puts "Source index fields: #{source_index_fields}"
-              ~r/^\s+\#(\w*)\s*$/mU |> Regex.scan(source_index_fields)
-                |> Stream.map(fn [line, field|_t] -> line |> String.replace(field, field |> replace_prefix_and_match_field(destination_fields)); _ -> "" end)
-                |> Enum.join("\r\n")
+            if ~r/^\s*$/m |> Regex.match?(dst_index_fields) do
+              source_index_def =
+                case index_name |> index_replace_prefix |> index_pattern |> Regex.run(source_indexes) do
+                  nil ->
+                    IO.puts "No match for index #{index_name} on R2"
+                    nil
+                  list when list |> is_list ->
+                    list |> hd
+                end
+              unless source_index_def == nil do
+                source_index_fields = ~r/INDEXFIELDS([\w\W]*)ENDINDEXFIELDS/miU |> Regex.run(source_index_def) |> List.last
+                destination_fields = destination |> fields() |> Enum.map(&String.upcase/1)
+                IO.puts "Source index fields: #{source_index_fields}"
+                ~r/^\s+\#(\w*)\s*$/mU |> Regex.scan(source_index_fields)
+                  |> Stream.map(fn [line, field|_t] -> line |> String.replace(field, field |> replace_prefix_and_match_field(destination_fields)); _ -> "" end)
+                  |> Enum.join("\r\n")
+              end
             else
               dst_index_fields
             end
@@ -283,6 +354,155 @@ defmodule UUIDReplaceGenerator do
     folder
       |> Enum.map(&Task.async(fn -> processor.(&1) end))
       |> Enum.each(&Task.await/1)
+  end
+
+  def capture_at(rex, source, index \\ 0) do
+    case rex |> Regex.run(source) do
+      nil -> nil
+      list when list |> is_list ->
+        list |> Enum.at(index)
+    end
+  end
+
+  def first_capture(rex, source) do
+    case rex |> Regex.run(source) do
+      nil -> nil
+      list when list |> is_list ->
+        list |> Enum.at(1)
+    end
+  end
+
+  def replace_prefix_and_match_list(name, list, replacement_map \\ %{"WHS" => "WAX", "TMS" => "TRX"}) do
+    replacement =
+      ("(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")")
+        |> Regex.compile!([:caseless]) |> Regex.replace(name, fn s, x -> s |> String.replace(x, replacement_map[x |> String.upcase] |> samecase(x)) end)
+    {replacement, list |> Enum.map(&(&1 |> String.upcase)) |> Enum.member?(replacement |> String.upcase)}
+  end
+
+  def property_def_rex(def_name) do
+    (~S"^\s*" <> def_name <> ~S"\s*\#(\w*)\s$") |> Regex.compile!([:caseless, :multiline, :ungreedy])
+  end
+
+  def extract_table_properties(table_source) do
+    case table_source |> table_definition do
+      nil -> nil
+      d ->
+        for key <- ["PrimaryIndex", "ClusterIndex", "ReplacementKey", "TitleField1", "TitleField2"],
+          into: %{}, do: {key, key |> property_def_rex |> capture_at(d, 1)}
+    end
+  end
+
+  def table_index_info(table_source) do
+    index_def_rex = fn def_name -> (~S"^\s*" <> def_name <> ~S"\s*\#(\w*)\s$") |> Regex.compile!([:caseless, :multiline, :ungreedy]) end
+    case table_definition = table_source |> table_definition do
+      nil -> nil
+      d ->
+        primaryIndex = ~r/^\s*PrimaryIndex\s*\#(\w*)\s*$/imU |> first_capture(d)
+        clusterIndex = "ClusterIndex" |> index_def_rex.() |> first_capture(d)
+        replacementKey = "ReplacementKey" |> index_def_rex.() |> first_capture(d)
+        {primaryIndex, clusterIndex, replacementKey}
+    end
+  end
+
+  def group_definition_rex(start_tag, end_tag) do
+    (~S"^\s*" <> start_tag <> ~S"\s*$([\w\W]*)" <> end_tag <> ~S"\s*$")
+      |> Regex.compile!([:caseless, :multiline, :ungreedy])
+  end
+
+  def extract_group_definition(definition, start_tag, end_tag) do
+    rex = group_definition_rex start_tag, end_tag
+    rex |> first_capture(definition)
+  end
+
+  def full_table_def_rex do
+    ~r/^\s*TABLE\s+\#\w*([\w\W]*)^\s*ENDPROPERTIES\s*$/miU
+  end
+
+  def full_table_definition(source) do
+    case full_table_def_rex
+      |> Regex.run(source) do
+        nil -> nil
+        list when list |> is_list ->
+          list |> List.first
+      end
+  end
+
+  def props_rex do
+    ~r/^\s*PROPERTIES\s*$([\w\W]*)^\s*ENDPROPERTIES\s*$/miU
+  end
+
+  def extract_properties(definition) do
+    case ~r/^\s*PROPERTIES\s*$([\w\W]*)^\s*ENDPROPERTIES\s*$/miU
+      |> Regex.run(definition) do
+        nil -> nil
+        list when list |> is_list ->
+          list |> Enum.at(1)
+      end
+  end
+
+  def fix_props_and_field_groups(source, destination) do
+    stage1 = source |> upgrade_props(destination)
+    stage2 = source |> copy_field_groups(stage1)
+    stage2
+  end
+
+  def upgrade_props(source, destination) do
+    source_properties = source |> extract_table_properties
+    destination_props = destination |> full_table_definition |> extract_properties |> props_def_to_map
+    updraded_props = destination_props |> override_props(source_properties)
+    packed_props = updraded_props |> collapse_props_map
+    before_props = destination |> String.split("PROPERTIES", parts: 2) |> Enum.at(0)
+    after_end_props = destination |> String.split("ENDPROPERTIES", parts: 2) |> Enum.at(1)
+    [before_props, "PROPERTIES", packed_props, "ENDPROPERTIES", after_end_props] |> Enum.join("\r\n")
+    # destination |> String.replace(props_rex, fn x, y -> x |> String.replace(y, "\r\n" <> packed_props <> "\r\n") end, global: false)
+    # destination |> String.replace(full_table_def_rex, fn x, _ -> x |> String.replace(props_rex, fn _, y -> ("\r\n" <> packed_props <> "\r\n") end, global: false) end, global: false)
+  end
+
+  def props_def_to_map(properties) do
+    named_captures =
+      properties |> String.split("\n") |> Stream.map(fn line ->
+        case ~r/^\s*(?<name>\w*)\s*\#(?<value>[\w\W]*)\s*$/miU
+          |> Regex.named_captures(line) do
+            nil -> nil
+            map when map |> is_map ->
+              map
+          end
+      end)
+      |> Stream.filter(fn nil -> false; _ -> true end)
+    props_map = for %{"name" => name, "value" => value} <- named_captures, into: %{}, do: {name, value}
+    props_map
+  end
+
+  def override_props(props_map, override_map) do
+    props_map |> Map.merge(for {k, v} <- override_map, v != nil, into: %{}, do: {k, v |> replace_samecase()})
+  end
+
+  def collapse_props_map(props_map) do
+    for {k, v} <- props_map, into: "", do: "#{k} \##{v}\r\n"
+  end
+
+  def table_definition(source) do
+    case ~r/^\s*TABLE\s+\#\w*([\w\W]*)^\s*ENDPROPERTIES\s*$/miU
+      |> Regex.run(source) do
+        nil -> nil
+        list when list |> is_list ->
+          list |> List.last
+      end
+  end
+
+  def indexes(source) do
+    indexes_def =
+      case ~r/INDICES(?<indexes>[\w\W]*)ENDINDICES/miU |> Regex.run(source) do
+        nil ->
+          IO.puts "No indexes found"
+          nil
+        list when list |> is_list -> list |> List.last
+      end
+    unless indexes_def == nil do
+      ~r/^\s*\#(\w*)\s*^\s*PROPERTIES[\w\W]*ENDINDEXFIELDS/miU
+        |> Regex.scan(indexes_def)
+        |> Enum.map(fn [_x,x|_t] -> x end)
+    end
   end
 
   def process_files_w_tasks(folder, processor) do
@@ -542,7 +762,7 @@ defmodule UUIDReplaceGenerator do
 
   def replace_samecase(source, replacement_map \\ %{"WAX" => "WHS", "TRX" => "TMS"}) do
     "(" <> (replacement_map |> Map.keys |> Enum.join("|")) <> ")"
-      |> Regex.compile!([:caseless])
+      |> Regex.compile!([:caseless, :multiline])
       |> Regex.replace(source, fn x, y -> x |> String.replace(y, replacement_map[y |> String.upcase] |> samecase(y)) end, global: true)
   end
 
